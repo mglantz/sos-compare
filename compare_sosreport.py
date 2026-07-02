@@ -21,6 +21,7 @@ Only standard library is used, so no extra installs are required.
 import argparse
 import difflib
 import glob
+import itertools
 import os
 import re
 import sys
@@ -32,6 +33,26 @@ from collections import OrderedDict
 # ---------------------------------------------------------------------------
 # Extraction / location helpers
 # ---------------------------------------------------------------------------
+
+def extract_safe(tf, dest):
+    """Extract only regular files, directories, and (sym/hard) links from a
+    tar archive, skipping special files (device nodes, FIFOs, sockets).
+
+    sosreport tarballs sometimes include placeholder entries for things
+    like /dev nodes or /run/systemd/sessions/*.ref that are captured as
+    tar "special" member types. Python 3.12+'s default extraction filter
+    (PEP 706) raises tarfile.SpecialFileError on these, even though we
+    never need them for a config/artifact comparison — so filter them out
+    up front instead.
+    """
+    members = [m for m in tf.getmembers()
+               if m.isreg() or m.isdir() or m.issym() or m.islnk()]
+    try:
+        tf.extractall(dest, members=members, filter="data")
+    except TypeError:
+        # Python < 3.12 doesn't support the `filter` kwarg.
+        tf.extractall(dest, members=members)
+
 
 def prepare_root(path, tmp_base):
     """Return a directory that is the root of an extracted sosreport tree.
@@ -45,7 +66,7 @@ def prepare_root(path, tmp_base):
     elif os.path.isfile(path) and tarfile.is_tarfile(path):
         dest = tempfile.mkdtemp(dir=tmp_base)
         with tarfile.open(path) as tf:
-            tf.extractall(dest)
+            extract_safe(tf, dest)
         root = dest
     else:
         sys.exit(f"error: '{path}' is not a directory or a readable tar archive")
@@ -128,19 +149,63 @@ class Report:
         return "\n".join(out)
 
 
-def unified_text_diff(label_a, label_b, lines_a, lines_b, context=0):
-    """Generic line-based unified diff, wrapped in a fenced code block.
-    Returns (markdown_body, changed_bool)."""
+DIFF_WIDTH = 130  # total width of the side-by-side block, like `diff -y -W`
+
+
+def _fit(text, col_width):
+    """Pad/truncate a line to exactly col_width chars, like diff -y does."""
+    text = text.rstrip("\n")
+    if len(text) > col_width:
+        return text[: col_width - 1] + "\u2026"  # ellipsis
+    return text.ljust(col_width)
+
+
+def side_by_side_diff(label_a, label_b, lines_a, lines_b, width=DIFF_WIDTH):
+    """Render a `diff -y` style side-by-side comparison, wrapped in a
+    fenced code block. Only differing regions are shown (no equal/context
+    lines), same philosophy as the old context=0 unified diff.
+
+    Markers, matching `diff -y`:
+        <   line only on the left  (label_a)
+        >   line only on the right (label_b)
+        |   line present on both sides but changed
+    Returns (markdown_body, changed_bool).
+    """
     if lines_a is None and lines_b is None:
         return "_artifact not present in either report_", False
     if lines_a is None or lines_b is None:
         missing = label_a if lines_a is None else label_b
         return f"_artifact missing from **{missing}**_", True
-    diff = list(difflib.unified_diff(lines_a, lines_b, fromfile=label_a,
-                                      tofile=label_b, lineterm="", n=context))
-    if not diff:
+
+    col = max(10, (width - 3) // 2)
+    sm = difflib.SequenceMatcher(a=lines_a, b=lines_b, autojunk=False)
+
+    rows = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        a_seg, b_seg = lines_a[i1:i2], lines_b[j1:j2]
+        if tag == "replace":
+            for a, b in itertools.zip_longest(a_seg, b_seg):
+                if a is not None and b is not None:
+                    rows.append(f"{_fit(a, col)} | {b}")
+                elif a is not None:
+                    rows.append(f"{_fit(a, col)} <")
+                else:
+                    rows.append(f"{_fit('', col)} > {b}")
+        elif tag == "delete":
+            for a in a_seg:
+                rows.append(f"{_fit(a, col)} <")
+        elif tag == "insert":
+            for b in b_seg:
+                rows.append(f"{_fit('', col)} > {b}")
+
+    if not rows:
         return "_identical_", False
-    body = "```diff\n" + "\n".join(diff) + "\n```"
+
+    header = f"{_fit(label_a, col)}   {label_b}"
+    sep = f"{'-' * col}   {'-' * min(col, 40)}"
+    body = "```\n" + header + "\n" + sep + "\n" + "\n".join(rows) + "\n```"
     return body, True
 
 
@@ -344,7 +409,7 @@ def get_lines(root, *rel_globs):
     return read_lines(path), path
 
 
-def compare(root_a, root_b, label_a, label_b):
+def compare(root_a, root_b, label_a, label_b, width=DIFF_WIDTH):
     report = Report(label_a, label_b)
 
     # --- OS release ---
@@ -356,13 +421,13 @@ def compare(root_a, root_b, label_a, label_b):
     # --- redhat-release ---
     la, _ = get_lines(root_a, "etc/redhat-release")
     lb, _ = get_lines(root_b, "etc/redhat-release")
-    body, changed = unified_text_diff(label_a, label_b, la, lb)
+    body, changed = side_by_side_diff(label_a, label_b, la, lb, width=width)
     report.add("RHEL Release (/etc/redhat-release)", body, changed)
 
     # --- kernel (uname -a) ---
     la, _ = get_lines(root_a, "sos_commands/kernel/uname_-a", "uname")
     lb, _ = get_lines(root_b, "sos_commands/kernel/uname_-a", "uname")
-    body, changed = unified_text_diff(label_a, label_b, la, lb)
+    body, changed = side_by_side_diff(label_a, label_b, la, lb, width=width)
     report.add("Kernel Version (uname -a)", body, changed)
 
     # NOTE: hostname/hostnamectl is intentionally NOT compared here — it is
@@ -421,25 +486,25 @@ def compare(root_a, root_b, label_a, label_b):
     # --- fstab ---
     la, _ = get_lines(root_a, "etc/fstab")
     lb, _ = get_lines(root_b, "etc/fstab")
-    body, changed = unified_text_diff(label_a, label_b, la, lb)
+    body, changed = side_by_side_diff(label_a, label_b, la, lb, width=width)
     report.add("/etc/fstab", body, changed)
 
     # --- mounts / findmnt ---
     la, _ = get_lines(root_a, "sos_commands/filesys/findmnt", "sos_commands/filesys/mount_-l")
     lb, _ = get_lines(root_b, "sos_commands/filesys/findmnt", "sos_commands/filesys/mount_-l")
-    body, changed = unified_text_diff(label_a, label_b, la, lb)
+    body, changed = side_by_side_diff(label_a, label_b, la, lb, width=width)
     report.add("Active Mounts (findmnt)", body, changed)
 
     # --- block devices ---
     la, _ = get_lines(root_a, "sos_commands/block/lsblk")
     lb, _ = get_lines(root_b, "sos_commands/block/lsblk")
-    body, changed = unified_text_diff(label_a, label_b, la, lb)
+    body, changed = side_by_side_diff(label_a, label_b, la, lb, width=width)
     report.add("Block Devices (lsblk)", body, changed)
 
     # --- disk usage (df) ---
     la, _ = get_lines(root_a, "sos_commands/filesys/df_-al_-x_autofs", "df")
     lb, _ = get_lines(root_b, "sos_commands/filesys/df_-al_-x_autofs", "df")
-    body, changed = unified_text_diff(label_a, label_b, la, lb)
+    body, changed = side_by_side_diff(label_a, label_b, la, lb, width=width)
     report.add("Disk Usage (df)", body, changed)
 
     # NOTE: network interfaces (ip address) and the routing table are
@@ -449,7 +514,7 @@ def compare(root_a, root_b, label_a, label_b):
     # --- firewalld ---
     la, _ = get_lines(root_a, "sos_commands/firewalld/firewall-cmd_--list-all-zones")
     lb, _ = get_lines(root_b, "sos_commands/firewalld/firewall-cmd_--list-all-zones")
-    body, changed = unified_text_diff(label_a, label_b, la, lb)
+    body, changed = side_by_side_diff(label_a, label_b, la, lb, width=width)
     report.add("Firewalld Zones (firewall-cmd --list-all-zones)", body, changed)
 
     # --- enabled/disabled services ---
@@ -471,6 +536,9 @@ def main():
     ap.add_argument("report_b", help="Second sosreport (.tar.xz/.tar.gz or extracted dir)")
     ap.add_argument("-o", "--output", default="sosreport-comparison.md",
                      help="Path to write the Markdown report (default: %(default)s)")
+    ap.add_argument("-W", "--width", type=int, default=DIFF_WIDTH,
+                     help="Total width of side-by-side diff output, like `diff -y -W` "
+                          "(default: %(default)s)")
     args = ap.parse_args()
 
     with tempfile.TemporaryDirectory() as tmp_base:
@@ -482,7 +550,7 @@ def main():
         if label_a == label_b:
             label_a, label_b = f"{label_a} (A)", f"{label_b} (B)"
 
-        report = compare(root_a, root_b, label_a, label_b)
+        report = compare(root_a, root_b, label_a, label_b, width=args.width)
         rendered = report.render()
 
         with open(args.output, "w") as f:

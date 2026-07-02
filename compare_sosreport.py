@@ -506,6 +506,100 @@ def diff_process_set(label_a, label_b, lines_a, lines_b):
     return "\n".join(parts), changed
 
 
+# --- SELinux process label comparison ----------------------------------
+# `ps auxZww` output: LABEL USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
+# The LABEL column is a full SELinux context, e.g.
+#   system_u:system_r:container_t:s0:c127,c392
+# The trailing MCS category set (the "c127,c392" / "c0.c1023" part) is
+# randomly assigned per container instance by podman for isolation - it's
+# exactly the same kind of per-instance noise as container IDs, and will
+# never match across two captures of "the same" container. Collapse it so
+# the meaningful part (user:role:type:sensitivity) still compares cleanly.
+
+_MCS_CATEGORY_RE = re.compile(r":c\d+(?:\.c\d+)?(?:,c\d+(?:\.c\d+)?)*")
+_PS_LABEL_HEADER_RE = re.compile(r"^\s*LABEL\s+")
+
+
+def normalize_selinux_label(label):
+    return _MCS_CATEGORY_RE.sub(":<MCS>", label)
+
+
+def parse_ps_selinux(lines):
+    """Parse `ps auxZww` (or similar -Z) output into a dict mapping
+    normalized command -> set of normalized SELinux labels observed for
+    that command. Multiple processes can share a command (e.g. several
+    containers running the same image) with different MCS categories;
+    those collapse into one label after normalization, but a genuine type
+    mismatch (different SELinux *type*) still shows up as a distinct
+    label in the set."""
+    result = {}
+    if not lines:
+        return result
+    start = 1 if lines and _PS_LABEL_HEADER_RE.match(lines[0]) else 0
+    for line in lines[start:]:
+        if not line.strip():
+            continue
+        parts = line.split(None, 11)
+        if len(parts) < 3:
+            continue
+        label = normalize_selinux_label(parts[0])
+        # Standard auxZww layout has 12 columns (LABEL..TIME + COMMAND);
+        # fall back to "last field" for shorter -Z variants (e.g. `ps -eZ`
+        # is LABEL PID TTY TIME CMD).
+        cmd = parts[11] if len(parts) >= 12 else parts[-1]
+        cmd = cmd.strip().lstrip("\\_| \t")
+        if not cmd:
+            continue
+        norm_cmd = normalize_process_cmd(cmd)
+        result.setdefault(norm_cmd, set()).add(label)
+    return result
+
+
+def diff_selinux_labels(label_a, label_b, lines_a, lines_b):
+    if lines_a is None and lines_b is None:
+        return "_SELinux-aware process listing (ps -Z) not present in either report_", False
+    if lines_a is None or lines_b is None:
+        missing = label_a if lines_a is None else label_b
+        return f"_SELinux-aware process listing missing from **{missing}**_", True
+
+    da, db = parse_ps_selinux(lines_a), parse_ps_selinux(lines_b)
+
+    # Only compare processes present in BOTH reports - a process that only
+    # exists on one side is not a label difference, it's a process
+    # existence difference (already covered by the Running Processes
+    # section), so it's deliberately excluded here.
+    common_cmds = set(da) & set(db)
+    pairs_a = {(cmd, lbl) for cmd in common_cmds for lbl in da[cmd]}
+    pairs_b = {(cmd, lbl) for cmd in common_cmds for lbl in db[cmd]}
+    only_a = sorted(pairs_a - pairs_b)
+    only_b = sorted(pairs_b - pairs_a)
+    changed = bool(only_a or only_b)
+
+    def render_table(pairs):
+        rows = ["| Process | Label |", "|---|---|"]
+        for cmd, lbl in pairs:
+            display_cmd = cmd if len(cmd) <= 80 else cmd[:77] + "..."
+            rows.append(f"| `{display_cmd}` | `{lbl}` |")
+        return "\n".join(rows)
+
+    parts = [f"Processes present in both reports (MCS categories normalized): "
+             f"{len(common_cmds)}\n"]
+
+    if only_a:
+        parts.append(f"**Only on {label_a} ({len(only_a)}):**\n")
+        parts.append(render_table(only_a))
+        parts.append("")
+    if only_b:
+        parts.append(f"**Only on {label_b} ({len(only_b)}):**\n")
+        parts.append(render_table(only_b))
+        parts.append("")
+
+    if not changed:
+        parts.append("_identical SELinux labels for all matched processes_")
+
+    return "\n".join(parts), changed
+
+
 LISTEN_ADDR_RE = re.compile(r"(\[?[0-9a-fA-F:.*]+\]?:\d+)")
 
 
@@ -749,6 +843,14 @@ def compare(root_a, root_b, label_a, label_b, width=DIFF_WIDTH):
     entries_b, source_b = get_listening_sockets(root_b)
     body, changed = diff_listening_sockets(label_a, label_b, entries_a, entries_b, source_a, source_b)
     report.add("Listening Sockets (TCP/UDP)", body, changed)
+
+    # --- SELinux process labels ---
+    la, _ = get_lines(root_a, "sos_commands/selinux/ps_auxZww", "sos_commands/selinux/ps_auxZ",
+                       "sos_commands/selinux/ps_-eZ", "sos_commands/selinux/ps_eZ")
+    lb, _ = get_lines(root_b, "sos_commands/selinux/ps_auxZww", "sos_commands/selinux/ps_auxZ",
+                       "sos_commands/selinux/ps_-eZ", "sos_commands/selinux/ps_eZ")
+    body, changed = diff_selinux_labels(label_a, label_b, la, lb)
+    report.add("SELinux Process Labels", body, changed)
 
     return report
 

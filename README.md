@@ -56,6 +56,7 @@ automatically when the script exits.
 | Systemd Unit Enablement | `sos_commands/systemd/systemctl_list-unit-files` | per-unit enabled/disabled state diff, only differing units shown |
 | Running Processes | `sos_commands/process/ps_auxfwww` (or `ps_auxwwwm`/`ps_alxwww`/`ps_-elfL`) | command-line set diff, PID/CPU/MEM/START/TIME columns ignored |
 | Listening Sockets (TCP/UDP) | `ss`/`netstat` output, falling back to `/proc/net/tcp[6]` | LISTEN-state entry set diff |
+| SELinux Process Labels | `sos_commands/selinux/ps_auxZww` (or `ps_auxZ`/`ps_-eZ`/`ps_eZ`) | label diff for processes present in both reports only, MCS categories normalized |
 
 File lookups use glob patterns with fallbacks (e.g. `ip_-d_address` →
 `ip_address`) since exact `sos_commands` filenames can shift slightly
@@ -130,6 +131,25 @@ Compared 15 artifact sections; 2 differ. Report written to: report.md
   possible source of incidental noise — e.g. random `/tmp/tmpXXXXXX`
   suffixes or embedded epoch timestamps aren't normalized — so some
   false positives are still possible on more exotic command lines.
+- **SELinux Process Labels**: parses `ps auxZww` (the SELinux-aware `ps`
+  variant sosreport collects) and compares SELinux labels **only for
+  processes present in both reports** — a process that exists on just one
+  host is a process-existence difference (already covered by the Running
+  Processes section above) and is deliberately excluded here, so this
+  section shows purely label differences on matched processes. Pairs each
+  matched process with its label on each host and diffs the resulting
+  set of unique (process, label) combinations; a mismatch shows up as the
+  same process appearing once under "only on A" and once under "only on
+  B" with different labels.
+
+  The trailing MCS category pair in container labels (e.g.
+  `container_t:s0:c127,c392`) is normalized to `container_t:s0:<MCS>`
+  before comparison — podman assigns these randomly per container
+  instance for isolation, so without normalization every container would
+  look "mislabeled" relative to every other container of the same image,
+  even on the same host. The SELinux *type* (`container_t`, `chronyd_t`,
+  `unconfined_service_t`, etc.) — which is what actually matters for
+  troubleshooting an AVC denial — is left untouched.
 - **Listening Sockets**: the script tries `ss`/`netstat` output first
   (several common filename variants), and falls back to decoding
   `/proc/net/tcp` and `/proc/net/tcp6` directly if neither was collected.

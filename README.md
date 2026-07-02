@@ -24,6 +24,7 @@ python3 compare_sosreports.py <sosreport_1> <sosreport_2> [-o report.md]
 |---|---|
 | `sosreport_1`, `sosreport_2` | Each may be a sosreport archive (`.tar.xz`, `.tar.gz`, `.tar.bz2`) or a path to an already-extracted sosreport directory. |
 | `-o`, `--output` | Path to write the Markdown report to. Default: `sosreport-comparison.md` |
+| `-W`, `--width` | Total width of the side-by-side diff output, like `diff -y -W`. Default: `130` |
 
 **Example:**
 
@@ -39,25 +40,42 @@ automatically when the script exits.
 | Section | Source artifact | Comparison method |
 |---|---|---|
 | OS Release | `etc/os-release` | key/value diff |
-| RHEL Release | `etc/redhat-release` | line diff |
-| Kernel Version | `sos_commands/kernel/uname_-a` | line diff |
+| RHEL Release | `etc/redhat-release` | side-by-side (`diff -y` style) |
+| Kernel Version | `sos_commands/kernel/uname_-a` | side-by-side (`diff -y` style) |
 | CPU | `proc/cpuinfo` | model name + logical CPU count |
 | Memory | `proc/meminfo` | MemTotal/MemFree/MemAvailable/SwapTotal/SwapFree |
 | Installed RPMs | `installed-rpms` | package set diff (added/removed) + version diff for packages present in both |
 | Loaded Kernel Modules | `sos_commands/kernel/lsmod` | module name set diff |
 | sysctl -a | `sos_commands/kernel/sysctl_-a` | key/value diff, only differing keys shown |
 | SELinux Config | `etc/selinux/config` | key/value diff |
-| /etc/fstab | `etc/fstab` | line diff |
-| Active Mounts | `sos_commands/filesys/findmnt` (or `mount_-l`) | line diff |
-| Block Devices | `sos_commands/block/lsblk` | line diff |
-| Disk Usage | `sos_commands/filesys/df_-al_-x_autofs` (or `df`) | line diff |
-| Firewalld Zones | `sos_commands/firewalld/firewall-cmd_--list-all-zones` | line diff |
+| /etc/fstab | `etc/fstab` | side-by-side (`diff -y` style) |
+| Active Mounts | `sos_commands/filesys/findmnt` (or `mount_-l`) | side-by-side (`diff -y` style) |
+| Block Devices | `sos_commands/block/lsblk` | side-by-side (`diff -y` style) |
+| Disk Usage | `sos_commands/filesys/df_-al_-x_autofs` (or `df`) | side-by-side (`diff -y` style) |
+| Firewalld Zones | `sos_commands/firewalld/firewall-cmd_--list-all-zones` | side-by-side (`diff -y` style) |
 | Systemd Unit Enablement | `sos_commands/systemd/systemctl_list-unit-files` | per-unit enabled/disabled state diff, only differing units shown |
 
 File lookups use glob patterns with fallbacks (e.g. `ip_-d_address` →
 `ip_address`) since exact `sos_commands` filenames can shift slightly
 across `sos` package versions. If an artifact is missing from one or both
 reports, that's reported explicitly rather than silently skipped.
+
+### Side-by-side diff format
+
+Free-text artifacts (fstab, mounts, lsblk, df, firewalld zones, release/
+kernel strings) are rendered like `diff -y`: two columns, left = first
+report, right = second report, inside a fenced code block. Only differing
+lines are shown — matching lines are omitted, same idea as running
+`diff -y` with zero context. Markers, same meaning as `diff -y`:
+
+| Marker | Meaning |
+|---|---|
+| `\|` | line present on both sides, but changed |
+| `<` | line only in the first report (left column) |
+| `>` | line only in the second report (right column) |
+
+Long lines are truncated with `…` to fit the column width; use `-W/--width`
+to widen or narrow the output if lines are getting cut off.
 
 ## Output
 

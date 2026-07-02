@@ -1,2 +1,88 @@
-# sos-compare
-Simple self contained python script which compares two sosreports to see differences between two systems
+# compare_sosreports.py
+
+Compare two RHEL 9 [sosreport](https://github.com/sosreport/sos) archives and
+produce a Markdown diff report covering the artifacts that matter most for
+host-to-host comparison — OS/kernel version, installed RPMs, kernel modules,
+sysctl values, SELinux config, fstab/mounts, block devices, disk usage,
+firewalld zones, and systemd unit enablement.
+
+It deliberately **skips** artifacts that are certain to differ between any
+two hosts and add no diagnostic signal — hostname, IP addresses, routing
+table, and collection timestamp.
+
+Python 3 standard library only — no dependencies to install.
+
+## Usage
+
+```
+python3 compare_sosreports.py <sosreport_1> <sosreport_2> [-o report.md]
+```
+
+**Arguments:**
+
+| Argument | Description |
+|---|---|
+| `sosreport_1`, `sosreport_2` | Each may be a sosreport archive (`.tar.xz`, `.tar.gz`, `.tar.bz2`) or a path to an already-extracted sosreport directory. |
+| `-o`, `--output` | Path to write the Markdown report to. Default: `sosreport-comparison.md` |
+
+**Example:**
+
+```
+python3 compare_sosreports.py sosreport-node1-2026-07-02.tar.xz sosreport-node2-2026-07-02.tar.xz -o node1-vs-node2.md
+```
+
+Archives are extracted to a temporary directory that is cleaned up
+automatically when the script exits.
+
+## What it compares
+
+| Section | Source artifact | Comparison method |
+|---|---|---|
+| OS Release | `etc/os-release` | key/value diff |
+| RHEL Release | `etc/redhat-release` | line diff |
+| Kernel Version | `sos_commands/kernel/uname_-a` | line diff |
+| CPU | `proc/cpuinfo` | model name + logical CPU count |
+| Memory | `proc/meminfo` | MemTotal/MemFree/MemAvailable/SwapTotal/SwapFree |
+| Installed RPMs | `installed-rpms` | package set diff (added/removed) + version diff for packages present in both |
+| Loaded Kernel Modules | `sos_commands/kernel/lsmod` | module name set diff |
+| sysctl -a | `sos_commands/kernel/sysctl_-a` | key/value diff, only differing keys shown |
+| SELinux Config | `etc/selinux/config` | key/value diff |
+| /etc/fstab | `etc/fstab` | line diff |
+| Active Mounts | `sos_commands/filesys/findmnt` (or `mount_-l`) | line diff |
+| Block Devices | `sos_commands/block/lsblk` | line diff |
+| Disk Usage | `sos_commands/filesys/df_-al_-x_autofs` (or `df`) | line diff |
+| Firewalld Zones | `sos_commands/firewalld/firewall-cmd_--list-all-zones` | line diff |
+| Systemd Unit Enablement | `sos_commands/systemd/systemctl_list-unit-files` | per-unit enabled/disabled state diff, only differing units shown |
+
+File lookups use glob patterns with fallbacks (e.g. `ip_-d_address` →
+`ip_address`) since exact `sos_commands` filenames can shift slightly
+across `sos` package versions. If an artifact is missing from one or both
+reports, that's reported explicitly rather than silently skipped.
+
+## Output
+
+A single Markdown file containing:
+
+1. A **Summary** listing which sections differ and which are identical.
+2. One subsection per artifact, showing either `_identical_` or the actual
+   diff (unified diff for free-text files, a Markdown table for key/value
+   and RPM comparisons).
+
+The script also prints a one-line summary to stdout, e.g.:
+
+```
+Compared 15 artifact sections; 2 differ. Report written to: report.md
+```
+
+## Known limitations
+
+- Large free-text artifacts (e.g. `dmesg`, full `journalctl` output) are
+  not compared — they're too noisy for a line diff to be useful and don't
+  currently have a dedicated parser.
+- Container/podman artifacts (`sos_commands/podman/*`) are not covered.
+  If your sosreports include the podman plugin, this is a natural
+  extension.
+- `sysctl -a` and `installed-rpms` diffs assume the standard `sos`-package
+  output format; heavily customized or very old sosreport versions may not
+  parse cleanly (the script falls back to reporting the artifact as
+  missing/differing rather than crashing).

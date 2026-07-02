@@ -54,6 +54,8 @@ automatically when the script exits.
 | Disk Usage | `sos_commands/filesys/df_-al_-x_autofs` (or `df`) | side-by-side (`diff -y` style) |
 | Firewalld Zones | `sos_commands/firewalld/firewall-cmd_--list-all-zones` | side-by-side (`diff -y` style) |
 | Systemd Unit Enablement | `sos_commands/systemd/systemctl_list-unit-files` | per-unit enabled/disabled state diff, only differing units shown |
+| Running Processes | `sos_commands/process/ps_auxfwww` (or `ps_auxwwwm`/`ps_alxwww`/`ps_-elfL`) | command-line set diff, PID/CPU/MEM/START/TIME columns ignored |
+| Listening Sockets (TCP/UDP) | `ss`/`netstat` output, falling back to `/proc/net/tcp[6]` | LISTEN-state entry set diff |
 
 File lookups use glob patterns with fallbacks (e.g. `ip_-d_address` →
 `ip_address`) since exact `sos_commands` filenames can shift slightly
@@ -104,3 +106,34 @@ Compared 15 artifact sections; 2 differ. Report written to: report.md
   output format; heavily customized or very old sosreport versions may not
   parse cleanly (the script falls back to reporting the artifact as
   missing/differing rather than crashing).
+- **Running Processes**: the diff compares the *set* of command lines —
+  PID, %CPU, %MEM, VSZ/RSS, START, and TIME columns are stripped out since
+  they're host- and moment-specific noise. On top of that, the command
+  text itself is normalized to remove incidental per-instance identifiers
+  that would otherwise make the same process look "different" every time:
+  - Long hex tokens (8-64 chars, must contain a letter a-f) → `<HASH>`.
+    This is aimed at container/image IDs — e.g. `conmon` process lines
+    from podman repeat the same 64-char container ID up to 8 times per
+    line, and that ID regenerates on every container restart, so without
+    this the same container would never match between two captures, or
+    between two hosts running the same service.
+  - UUIDs (`8-4-4-4-12` hex) → `<UUID>`.
+  - systemd session scope numbers (`session-123.scope`) → `session-<N>.scope`.
+  - Kernel per-CPU thread names (`[kworker/3:1-xfs]`, `[ksoftirqd/2]`,
+    `[migration/0]`, etc.) have their numeric core index collapsed to `N`,
+    since these vary purely with CPU count/topology, not with anything
+    meaningful about what's running.
+
+  This is deliberately conservative: plain numeric tokens (ports, PIDs
+  written as bare digits, buffer sizes, timeouts) are left untouched, so
+  genuine configuration differences still surface. It won't catch every
+  possible source of incidental noise — e.g. random `/tmp/tmpXXXXXX`
+  suffixes or embedded epoch timestamps aren't normalized — so some
+  false positives are still possible on more exotic command lines.
+- **Listening Sockets**: the script tries `ss`/`netstat` output first
+  (several common filename variants), and falls back to decoding
+  `/proc/net/tcp` and `/proc/net/tcp6` directly if neither was collected.
+  The `/proc/net/tcp[6]` fallback only extracts the port number (not the
+  full decoded IP), since the port is what matters most for this kind of
+  diff. UDP sockets aren't included in the fallback path, since UDP has no
+  true "LISTEN" state in `/proc/net/udp`.

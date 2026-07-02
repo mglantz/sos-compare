@@ -400,6 +400,181 @@ def diff_service_list(label_a, label_b, lines_a, lines_b):
     return body, changed
 
 
+PS_COMMAND_RE = re.compile(r"^\s*(?:USER|UID)\s+PID\b")
+
+# --- Normalization patterns for process command lines -----------------
+# Goal: two invocations of "the same" process should normalize to the same
+# string even when they embed incidental, per-instance identifiers that
+# will never match across hosts (or even across two captures of the same
+# host). Observed in the wild: podman/conmon command lines that repeat a
+# 64-char container ID up to 8 times per line, systemd session scope
+# numbers, and kernel per-CPU thread names like [kworker/3:1-xfs].
+
+_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+_HEX_TOKEN_RE = re.compile(r"\b[0-9a-fA-F]{8,64}\b")
+_SESSION_SCOPE_RE = re.compile(r"\bsession-\d+\.scope\b")
+_KERNEL_THREAD_RE = re.compile(r"^\[.*\]$")
+
+
+def _collapse_hex_token(match):
+    """Replace a bare hex-looking token with <HASH> only if it actually
+    contains a letter a-f — pure-digit tokens (PIDs, ports, buffer sizes,
+    timeouts) are left untouched so real config differences still show."""
+    token = match.group(0)
+    return "<HASH>" if re.search(r"[a-fA-F]", token) else token
+
+
+def normalize_process_cmd(cmd):
+    """Strip incidental per-instance identifiers from a process command
+    line so that recurring processes (container helpers, kernel threads,
+    login sessions) compare equal across captures instead of looking
+    unique every time. This is heuristic and intentionally conservative:
+    only clearly-identifier-shaped substrings (UUIDs, long hex hashes,
+    session scope numbers) are touched; ports, PIDs-as-plain-digits, and
+    other genuinely meaningful config values are left alone."""
+    if _KERNEL_THREAD_RE.match(cmd):
+        # e.g. [kworker/3:1-xfs-conv/vda3], [ksoftirqd/2], [migration/0]
+        # -> collapse per-CPU core indices so thread *types* still compare,
+        # without false diffs purely from differing CPU counts/topology.
+        inner = re.sub(r"\d+", "N", cmd[1:-1])
+        return f"[{inner}]"
+    cmd = _UUID_RE.sub("<UUID>", cmd)
+    cmd = _HEX_TOKEN_RE.sub(_collapse_hex_token, cmd)
+    cmd = _SESSION_SCOPE_RE.sub("session-<N>.scope", cmd)
+    return cmd
+
+
+def parse_ps_commands(lines):
+    """Parse `ps` output (auxfwww/auxwwwm/alxwww/-elfL style) into a set of
+    normalized command strings. PID/CPU/MEM/START/TIME columns are ignored
+    since they are host- and moment-specific noise; the extracted command
+    text is further normalized (see normalize_process_cmd) before being
+    added to the comparison set."""
+    commands = set()
+    if not lines:
+        return commands
+    header = None
+    for i, line in enumerate(lines):
+        if PS_COMMAND_RE.match(line):
+            header = line
+            break
+    start_idx = 1 if header is not None else 0
+    # Determine number of leading numeric/text columns to skip before COMMAND.
+    # Standard `ps auxww`-family output has 10 leading columns:
+    # USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND...
+    # `ps -elfL` has a different layout; fall back to best-effort split.
+    for line in lines[start_idx:]:
+        if not line.strip():
+            continue
+        parts = line.split(None, 10)
+        if len(parts) < 11:
+            # Unexpected layout (e.g. -elfL with extra column) - try 11 fields
+            parts = line.split(None, 11)
+            if len(parts) < 12:
+                continue
+            cmd = parts[11]
+        else:
+            cmd = parts[10]
+        cmd = cmd.strip().lstrip("\\_| \t")
+        if cmd:
+            commands.add(normalize_process_cmd(cmd))
+    return commands
+
+
+def diff_process_set(label_a, label_b, lines_a, lines_b):
+    if lines_a is None and lines_b is None:
+        return "_process list not present in either report_", False
+    if lines_a is None or lines_b is None:
+        missing = label_a if lines_a is None else label_b
+        return f"_process list missing from **{missing}**_", True
+
+    pa, pb = parse_ps_commands(lines_a), parse_ps_commands(lines_b)
+    only_a, only_b = sorted(pa - pb), sorted(pb - pa)
+    changed = bool(only_a or only_b)
+    parts = [f"Process count (after normalizing container IDs/hashes/session "
+             f"numbers): {label_a}={len(pa)}, {label_b}={len(pb)}\n"]
+    if only_a:
+        parts.append(f"**Only running on {label_a} ({len(only_a)}):**")
+        parts.append("```\n" + "\n".join(only_a) + "\n```")
+    if only_b:
+        parts.append(f"**Only running on {label_b} ({len(only_b)}):**")
+        parts.append("```\n" + "\n".join(only_b) + "\n```")
+    if not changed:
+        parts.append("_identical set of running process command lines_")
+    return "\n".join(parts), changed
+
+
+LISTEN_ADDR_RE = re.compile(r"(\[?[0-9a-fA-F:.*]+\]?:\d+)")
+
+
+def parse_ss_netstat_listening(lines):
+    """Extract LISTEN-state entries from `ss` or `netstat` output as a set
+    of 'proto local_addr:port' strings. Column layouts differ between ss
+    and netstat, but in both the local address:port is the first
+    address-like token on a LISTEN line, so a regex scan is more robust
+    than assuming fixed column positions."""
+    entries = set()
+    for line in lines or []:
+        if "LISTEN" not in line.upper():
+            continue
+        fields = line.split()
+        if not fields:
+            continue
+        proto = fields[0].lower()
+        if not proto.startswith(("tcp", "udp")):
+            continue
+        m = LISTEN_ADDR_RE.search(line)
+        if m:
+            entries.add(f"{proto} {m.group(1)}")
+    return entries
+
+
+def parse_proc_net_listening(lines, proto_label):
+    """Fallback parser for /proc/net/tcp[6] when ss/netstat aren't present
+    in the sosreport. Only extracts the port (skips full hex IP decode,
+    since the port is what matters most for a listening-socket diff).
+    State 0A (hex) = TCP_LISTEN."""
+    entries = set()
+    for line in (lines or [])[1:]:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        local, state = parts[1], parts[3]
+        if state.upper() != "0A":
+            continue
+        if ":" not in local:
+            continue
+        port_hex = local.split(":")[1]
+        try:
+            port = int(port_hex, 16)
+        except ValueError:
+            continue
+        entries.add(f"{proto_label} port {port}")
+    return entries
+
+
+def diff_listening_sockets(label_a, label_b, entries_a, entries_b, source_a, source_b):
+    if entries_a is None and entries_b is None:
+        return "_no ss/netstat/proc-net data available in either report_", False
+    if not entries_a and not entries_b:
+        return "_no listening sockets found in either report_", False
+    only_a, only_b = sorted(entries_a - entries_b), sorted(entries_b - entries_a)
+    changed = bool(only_a or only_b)
+    parts = [f"Listening sockets: {label_a}={len(entries_a)} (from {source_a}), "
+             f"{label_b}={len(entries_b)} (from {source_b})\n"]
+    if only_a:
+        parts.append(f"**Only listening on {label_a} ({len(only_a)}):**")
+        parts.append("```\n" + "\n".join(only_a) + "\n```")
+    if only_b:
+        parts.append(f"**Only listening on {label_b} ({len(only_b)}):**")
+        parts.append("```\n" + "\n".join(only_b) + "\n```")
+    if not changed:
+        parts.append("_identical set of listening sockets_")
+    return "\n".join(parts), changed
+
+
 # ---------------------------------------------------------------------------
 # Main comparison driver
 # ---------------------------------------------------------------------------
@@ -407,6 +582,40 @@ def diff_service_list(label_a, label_b, lines_a, lines_b):
 def get_lines(root, *rel_globs):
     path = find_first(root, *rel_globs)
     return read_lines(path), path
+
+
+def get_listening_sockets(root):
+    """Try ss, then netstat, then /proc/net/tcp[6] as a last resort.
+    Returns (entries_set_or_None, source_description)."""
+    for pattern, label in [
+        ("sos_commands/networking/ss_-tulpn", "ss -tulpn"),
+        ("sos_commands/networking/ss_-tulnp", "ss -tulnp"),
+        ("sos_commands/networking/ss_-tlnp", "ss -tlnp"),
+        ("sos_commands/networking/ss_-tuln", "ss -tuln"),
+        ("sos_commands/networking/ss_-natu*", "ss (natu)"),
+        ("sos_commands/networking/netstat_-neopa", "netstat -neopa"),
+        ("sos_commands/networking/netstat_-tulpn", "netstat -tulpn"),
+        ("sos_commands/networking/netstat_-tlnp", "netstat -tlnp"),
+        ("sos_commands/networking/netstat_-agn", "netstat -agn"),
+    ]:
+        lines, _ = get_lines(root, pattern)
+        if lines:
+            entries = parse_ss_netstat_listening(lines)
+            if entries:
+                return entries, label
+
+    # Fallback: decode /proc/net/tcp and /proc/net/tcp6 directly.
+    entries = set()
+    found_any = False
+    for rel, label in [("proc/net/tcp", "tcp"), ("proc/net/tcp6", "tcp6")]:
+        lines, _ = get_lines(root, rel)
+        if lines:
+            found_any = True
+            entries |= parse_proc_net_listening(lines, label)
+    if found_any:
+        return entries, "/proc/net/tcp[6]"
+
+    return None, "n/a"
 
 
 def compare(root_a, root_b, label_a, label_b, width=DIFF_WIDTH):
@@ -526,6 +735,20 @@ def compare(root_a, root_b, label_a, label_b, width=DIFF_WIDTH):
     # NOTE: collection date/time is intentionally NOT compared here — two
     # sosreports are essentially never captured at the same instant, so
     # this always "differs" and isn't a meaningful diff.
+
+    # --- Running processes ---
+    la, _ = get_lines(root_a, "sos_commands/process/ps_auxfwww", "sos_commands/process/ps_auxwwwm",
+                       "sos_commands/process/ps_alxwww", "sos_commands/process/ps_-elfL")
+    lb, _ = get_lines(root_b, "sos_commands/process/ps_auxfwww", "sos_commands/process/ps_auxwwwm",
+                       "sos_commands/process/ps_alxwww", "sos_commands/process/ps_-elfL")
+    body, changed = diff_process_set(label_a, label_b, la, lb)
+    report.add("Running Processes", body, changed)
+
+    # --- Listening sockets ---
+    entries_a, source_a = get_listening_sockets(root_a)
+    entries_b, source_b = get_listening_sockets(root_b)
+    body, changed = diff_listening_sockets(label_a, label_b, entries_a, entries_b, source_a, source_b)
+    report.add("Listening Sockets (TCP/UDP)", body, changed)
 
     return report
 
